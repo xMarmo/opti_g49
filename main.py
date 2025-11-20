@@ -1,40 +1,19 @@
-from gurobipy import GRB, Model
-from gurobipy import quicksum
+from gurobipy import GRB, Model, quicksum
+import math
 
-#inicialización modelo
+# FALTA IMPORTAR LOS DATOS 
+
+from datos import * # Inicialización del modelo
 model = Model("Optimizacion_Monitoreo_Relaves")
-model.setParam('TimeLimit', 300)
+model.setParam('TimeLimit', 1800)
 
-# Conjuntos
-I = range(1, 11) # relaves
-T = range(1, 366) # dias
-D = range(1, 6) # drones
-O = range(1, 4) # operadores
-
-# conjunto de tiempo extendido para manejar variable E_dt
-T_con_0 = range(0, 366)
+# Constante Big-M
+BigM = 10000 
+M_drones = len(D) # M para la restricción de asignación (cantidad de drones)
 
 
-# Parametros
-B = 1000000  # presupuesto
-alpha = 0.01 # ponderador de costos
-H = 2 # max drones por operador
-U = 100 # horas max de uso antes de mantencion
-R = {i: 10 for i in I} # riesgo del relave i
-f = {i: 5 for i in I} # frecuencia minima de monitoreo
-P = {i: 50 for i in I} # penalizacion monitoreos faltantes
-Q = {i: 0.5 for i in I} # tiempo minimo de monitoreo (hrs)
-n = {i: 1 if i % 2 == 0 else 0 for i in I} # 1 si relave i es de alto riesgo
-a = {d: 4 for d in D} # autonomia de vuelo (hrs)
-E0 = {d: 0 for d in D} # horas de uso acumulado inicial (en t=0)
-K = {t: 1 for t in T} # max drones en mantenimiento por dia 
-h = {t: 100 for t in T} # costo por operador por dia
-C = {(i, t): 50 for i in I for t in T} # costo monitoreo i en t
-F = {(o, t): 1 for o in O for t in T} # disponibilidad operador o en t
-g = {(d, t): 75 for d in D for t in T} # costo mantenimiento d en t
+# 1. VARIABLES DE DECISIÓN
 
-
-# Variables
 # x_it: 1 si se monitorea relave i en periodo t
 x = model.addVars(I, T, vtype=GRB.BINARY, name="x_monitoreo")
 
@@ -50,158 +29,202 @@ m = model.addVars(D, T, vtype=GRB.BINARY, name="m_mantenimiento")
 # u_t: numero de operadores usados en t
 u = model.addVars(T, vtype=GRB.INTEGER, name="u_n_operadores")
 
-# E_dt: uso acumulado de dron d al final de t
+# E_dt: uso acumulado de dron d al final de t (Requiere T_con_0 para condición inicial)
+# Asumimos que T_con_0 incluye el 0 y todos los t de T
 E = model.addVars(D, T_con_0, vtype=GRB.CONTINUOUS, name="E_uso_acumulado")
 
 # l_i: numero de monitoreos faltantes en relave i
 l = model.addVars(I, vtype=GRB.CONTINUOUS, name="l_monitoreos_faltantes")
 
-# Funcion objetivo
 
-# beneficio por riesgo de monitoreo
+# 2. FUNCIÓN OBJETIVO
+
+# Beneficio por riesgo de monitoreo
 termino_beneficio = quicksum(R[i] * x[i,t] for i in I for t in T)
 
-# costos operativos (ponderados por alpha)
+# Costos operativos (ponderados por alpha)
 costo_monitoreo = quicksum(C[i,t] * x[i,t] for i in I for t in T)
 costo_mantenimiento = quicksum(g[d,t] * m[d,t] for d in D for t in T)
 costo_operadores = quicksum(h[t] * u[t] for t in T)
 
 termino_costos = alpha * (costo_monitoreo + costo_mantenimiento + costo_operadores)
 
-# penalizacion por monitoreos faltantes
+# Penalización por monitoreos faltantes
 termino_penalizacion = quicksum(P[i] * l[i] for i in I)
 
-# Objetivo: maximizar el beneficio neto
+# Objetivo: Maximizar Beneficio Neto
 model.setObjective(
     termino_beneficio - termino_costos - termino_penalizacion,
     GRB.MAXIMIZE
 )
 
 
-# Restricciones
-
+# 3. RESTRICCIONES
 print("Agregando restricciones...")
 
-# R1: presupuesto
+# --- R1: Presupuesto ---
 model.addConstr(
     costo_monitoreo + costo_mantenimiento + costo_operadores <= B,
-    name="presupuesto"
+    name="R1_Presupuesto"
 )
 
-# R2: capacidad de supervision
+# --- R2: Capacidad de supervision ---
 model.addConstrs(
     (quicksum(z[i,d,t] for i in I for d in D) <= H * u[t] for t in T),
-    name="capacidad_supervision"
+    name="R2_Capacidad_Supervision"
 )
 
-# R3: limite de disponibilidad de operadores 
+# --- R3: Limite de disponibilidad de operadores ---
 model.addConstrs(
     (u[t] <= quicksum(F[o,t] for o in O) for t in T),
-    name="disponibilidad_operadores"
+    name="R3_Disponibilidad_Operadores"
 )
 
-# R4: autonomia por vuelo
-model.addConstrs(
-    (q[i,d,t] <= a[d] * z[i,d,t] for i in I for d in D for t in T),
-    name="autonomia_vuelo"
-)
-
-# R5: autonomia por dron (dia) y efecto mantenimiento
+# --- R4: Autonomia por dron (dia) y efecto mantenimiento ---
+# La suma de horas de vuelo de un dron no puede superar su autonomía
+# Y debe ser 0 si está en mantenimiento
 model.addConstrs(
     (quicksum(q[i,d,t] for i in I) <= a[d] * (1 - m[d,t]) for d in D for t in T),
-    name="autonomia_diaria_dron"
+    name="R4_Autonomia_Diaria"
 )
 
-# R6: uso acumulado del dron
-# Valor inicial t=0
+# --- BLOQUE DE USO ACUMULADO (R5, R6, R7, R8) ---
+# Condicion inicial (t=0)
 model.addConstrs(
     (E[d,0] == E0[d] for d in D),
-    name="uso_acumulado_inicial"
-)
-# Valor para t>=1
-model.addConstrs(
-    (E[d,t] == (E[d,t-1] + quicksum(q[i,d,t] for i in I)) * (1 - m[d,t]) for d in D for t in T),
-    name="uso_acumulado_dron"
+    name="Condicion_Inicial_E"
 )
 
-# R7: limite de uso (antes de mantenimiento)
+# R5 (Implícito en R7 y R8): Definición de acumulación linealizada
+# E_{t-1} + vuelo_actual <= U + M * m_dt
+# Si m=0 (operativo), E + q <= U (se cumple el límite)
+# Si E + q > U, obliga a m=1.
 model.addConstrs(
-    (E[d,t] <= U for d in D for t in T),
-    name="limite_uso"
+    (E[d,t-1] + quicksum(q[i,d,t] for i in I) <= U + BigM * m[d,t] for d in D for t in T),
+    name="R5_Forzar_Mantenimiento"
 )
 
-# R8: capacidad total de drones operativos por periodo
+# R6: Forzar a cero el uso acumulado si hay mantenimiento
 model.addConstrs(
-    (quicksum(z[i,d,t] for i in I for d in D) <= quicksum(1 - m[d,t] for d in D) for t in T),
-    name="drones_operativos"
+    (E[d,t] <= U * (1 - m[d,t]) for d in D for t in T),
+    name="R6_Reset_Mantenimiento"
 )
 
-# R9: asignacion dron - relave
+# R7: Límite inferior (Acumular horas si NO hay mantencion)
+# E_t >= E_{t-1} + q - M*m
 model.addConstrs(
-    (x[i,t] <= quicksum(z[i,d,t] for d in D) for i in I for t in T),
-    name="asignacion_dron_relave"
+    (E[d,t] >= E[d,t-1] + quicksum(q[i,d,t] for i in I) - BigM * m[d,t] for d in D for t in T),
+    name="R7_Limite_Inferior_Acumulacion"
 )
 
-# R10: cada dron realiza a lo sumo una mision simultanea
+# R8: Limite superior (Acumular horas si NO hay mantención)
+# E_t <= E_{t-1} + q + M*m
+model.addConstrs(
+    (E[d,t] <= E[d,t-1] + quicksum(q[i,d,t] for i in I) + BigM * m[d,t] for d in D for t in T),
+    name="R8_Limite_Superior_Acumulacion"
+)
+
+# --- R9: Capacidad total de drones operativos ---
+# Si m=1, sum(z) <= 0 (nadie vuela). Si m=0, sum(z) <= 1 (max 1 mision)
+model.addConstrs(
+    (quicksum(z[i,d,t] for i in I) <= 1 - m[d,t] for d in D for t in T),
+    name="R9_Capacidad_Operativa"
+)
+
+# --- R10: Asignación Dron - Relave ---
+# Parte A: Si x=0, entonces sum(z) <= 0 (nadie va). BigM aqui es numero de drones
+model.addConstrs(
+    (quicksum(z[i,d,t] for d in D) <= M_drones * x[i,t] for i in I for t in T),
+    name="R10_Consistencia_BigM"
+)
+# Parte B: Si x=1, entonces sum(z) >= 1 (alguien tiene que ir)
+model.addConstrs(
+    (quicksum(z[i,d,t] for d in D) >= x[i,t] for i in I for t in T),
+    name="R10_Asignacion_Minima"
+)
+
+# --- R11: Unicidad de Mision ---
 model.addConstrs(
     (quicksum(z[i,d,t] for i in I) <= 1 for d in D for t in T),
-    name="mision_unica_dron"
+    name="R11_Mision_Unica"
 )
 
-# R11: minimo tiempo de visita necesario
+# --- R12: Tiempo total y mínimo de visita ---
 model.addConstrs(
     (quicksum(q[i,d,t] for d in D) >= Q[i] * x[i,t] for i in I for t in T),
-    name="minimo_tiempo_visita"
+    name="R12_Tiempo_Minimo"
 )
 
-# R12: monitoreos faltantes
+# --- R13: Monitoreos Faltantes ---
 model.addConstrs(
-    (l[i] >= f[i] * n[i] - quicksum(x[i,t] for t in T) for i in I),
-    name="monitoreos_faltantes"
+    (l[i] >= f[i] - quicksum(x[i,t] for t in T) for i in I),
+    name="R13_Calculo_Faltantes"
 )
-# Monitoreos faltantes no negativos
+# No negatividad explícita para l[i] (aunque la variable ya es >=0 por defecto en Gurobi)
 model.addConstrs(
     (l[i] >= 0 for i in I),
-    name="no_negatividad_faltantes"
+    name="R13_No_Negatividad_l"
 )
 
-# R13: maxima cantidad de drones en mantenimiento
+# --- R14: Máximo mantenimiento simultáneo ---
 model.addConstrs(
     (quicksum(m[d,t] for d in D) <= K[t] for t in T),
-    name="max_mantenimiento"
+    name="R14_Capacidad_Mantenimiento"
 )
 
+# --- R15: Espaciamiento Temporal (Gap Dinámico) ---
+# Calculamos el gap y aplicamos ventana móvil
+print("Generando restricciones de espaciamiento...")
+for i in I:
+    # Solo si se requiere más de 1 visita (para evitar división por cero o lógica innecesaria)
+    if f[i] > 1:
+        # Cálculo del Gap según fórmula del informe
+        gap_i = int((365 / f[i]) * 0.8)
+        
+        # Seguridad: el gap debe ser al menos 1 día
+        if gap_i < 1: gap_i = 1
+        
+        # Iteramos t cuidando el rango para no salirnos de T (1 a 365)
+        # Rango final: 365 - gap + 1. En python range el tope es exclusivo, así que +2
+        for t in range(1, 365 - gap_i + 2):
+            # Definimos la ventana de días [t, t + gap_i - 1]
+            # Convertimos a lista para quicksum
+            ventana = range(t, t + gap_i) 
+            
+            # La suma de visitas en esa ventana debe ser <= 1
+            model.addConstr(
+                quicksum(x[i, k] for k in ventana if k in T) <= 1,
+                name=f"R15_Espaciamiento_Relave{i}_Dia{t}"
+            )
 
-# Optimizacion
-print("Restricciones agregadas, optimizando...")
+# ==========================================
+# 4. SOLUCIÓN E IMPRESIÓN
+# ==========================================
+print("Optimizando...")
 model.optimize()
 
-# Resultados
 if model.Status == GRB.OPTIMAL:
-    print("\nSolucion optima encontrada.")
-    print(f"Valor objetivo: {model.objVal:,.2f}")
+    print("\n--- SOLUCIÓN ÓPTIMA ENCONTRADA ---")
+    print(f"Valor Objetivo: {model.objVal:,.2f}")
 
-    print("\n--- Monitoreos a realizar (x_it) ---")
-    for t in T:
-        for i in I:
-            if x[i,t].X > 0.5:
-                print(f"Dia {t}: Monitorear relave {i}")
-    
-    print("\n--- Operadores a usar (u_t) ---")
-    for t in T:
-        if u[t].X > 0.1:
-            print(f"Dia {t}: Usar {u[t].X:.0f} operadores")
-
-    print("\n--- Monitores faltantes (l_i) ---")
+    print("\n--- Resumen de Actividad ---")
     for i in I:
-        if l[i].X > 0.1:
-            print(f"Relave {i}: Faltaron {l[i].X:.1f} monitoreos")
+        visitas = sum(x[i,t].X for t in T)
+        if visitas > 0.5:
+            print(f"Relave {i}: {visitas:.0f} visitas realizadas (Meta: {f[i]}, Faltan: {l[i].X:.1f})")
+            # Opcional: Imprimir fechas exactas para verificar espaciamiento
+            # fechas = [t for t in T if x[i,t].X > 0.5]
+            # print(f"   Fechas: {fechas}")
+
+    print("\n--- Uso de Operadores (Muestra) ---")
+    dias_con_ops = [t for t in T if u[t].X > 0.1]
+    print(f"Días con actividad operativa: {len(dias_con_ops)}")
 
 elif model.Status == GRB.INFEASIBLE:
-    print("\nEl modelo es infactible.")
-
-elif model.Status == GRB.TIME_LIMIT:
-    print("\nSe alcanzo el limite de tiempo sin encontrar solucion optima.")
-
-else: 
-    print(f"\nOptimizacion finalizada con estado: {model.Status}")
+    print("\nEl modelo es infactible. Revisando IIS...")
+    model.computeIIS()
+    model.write("modelo_infactible.ilp")
+    print("Revisa el archivo 'modelo_infactible.ilp' para ver el conflicto.")
+    
+else:
+    print(f"\nEstado de la optimización: {model.Status}")
