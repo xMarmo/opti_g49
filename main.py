@@ -2,68 +2,75 @@ import pandas as pd
 import os
 from gurobipy import GRB, Model, quicksum
 
+
 # 1. CARGA DE DATOS
 
-print("--- INICIANDO MODELO DE OPTIMIZACIN ---")
+print("--- INICIANDO MODELO DE OPTIMIZACION ---")
 print("Cargando parametros desde carpeta 'data'...")
 
 DATA_DIR = 'data'
 
-def cargar_parametro(archivo, cols_indice, col_valor):
-    ruta = os.path.join(DATA_DIR, archivo)
+# Funcion para cargar CSVs
+def leer_csv_robusto(nombre_archivo, uso_columnas=None):
+    ruta = os.path.join(DATA_DIR, nombre_archivo)
     if not os.path.exists(ruta):
         raise FileNotFoundError(f"Falta el archivo: {ruta}")
     
     try:
-        df = pd.read_csv(ruta, encoding='utf-8')
+        # UTF-8
+        df = pd.read_csv(ruta, encoding='utf-8', usecols=uso_columnas)
     except UnicodeDecodeError:
-        df = pd.read_csv(ruta, encoding='latin-1')
+        # Latin-1
+        print(f"Detectado encoding Latin-1 para {nombre_archivo}...")
+        df = pd.read_csv(ruta, encoding='latin-1', usecols=uso_columnas)
     
     df.columns = [c.strip() for c in df.columns]
-    
-    if isinstance(cols_indice, list):
-        return df.set_index(cols_indice)[col_valor].to_dict()
-    else:
-        return df.set_index(cols_indice)[col_valor].to_dict()
+    return df
 
 try:
-    
-    # c_it: Costo monitoreo (t, i, Cit)
-    df_cit = pd.read_csv(os.path.join(DATA_DIR, 'c_it.csv'))
+    # --- Carga de Parametros ---
+
+    # 1. c_it: Costo monitoreo (t, i, Cit)
+    df_cit = leer_csv_robusto('c_it.csv')
     C = df_cit.set_index(['i', 't'])['Cit'].to_dict()
 
-    # f_i: Frecuencia requerida (i, f_i)
-    f = cargar_parametro('f_i.csv', 'i', 'f_i')
+    # 2. f_i: Frecuencia requerida (i, f_i)
+    df_fi = leer_csv_robusto('f_i.csv')
+    f = df_fi.set_index('i')['f_i'].to_dict()
 
-    # F_ot: Disponibilidad Operador (t, o, Fot)
-    df_fot = pd.read_csv(os.path.join(DATA_DIR, 'f_ot.csv'))
+    # 3. F_ot: Disponibilidad Operador (t, o, Fot)
+    df_fot = leer_csv_robusto('f_ot.csv')
     F = df_fot.set_index(['o', 't'])['Fot'].to_dict()
 
-    # g_dt: Costo Mantencion Dron (t, d, gdt)
-    df_gdt = pd.read_csv(os.path.join(DATA_DIR, 'g_dt.csv'))
+    # 4. g_dt: Costo Mantencion Dron (t, d, gdt)
+    df_gdt = leer_csv_robusto('g_dt.csv')
     g = df_gdt.set_index(['d', 't'])['gdt'].to_dict()
 
-    # h_t: Costo Operador (t, Día, ht)
-    df_ht = pd.read_csv(os.path.join(DATA_DIR, 'h_t.csv'), usecols=['t', 'ht'])
+    # 5. h_t: Costo Operador (t, ht)
+    df_ht = leer_csv_robusto('h_t.csv', uso_columnas=['t', 'ht'])
     h = df_ht.set_index('t')['ht'].to_dict()
 
-    # K_t: Capacidad Mantencion (t, Kt)
-    K = cargar_parametro('K_t.csv', 't', 'Kt')
+    # 6. K_t: Capacidad Mantención (t, Kt)
+    df_kt = leer_csv_robusto('K_t.csv', uso_columnas=['t', 'Kt'])
+    K = df_kt.set_index('t')['Kt'].to_dict()
 
-    # P_i: Penalizacion (i, Pi)
-    P = cargar_parametro('P_i.csv', 'i', 'Pi')
+    # 7. P_i: Penalizacion (i, Pi)
+    df_pi = leer_csv_robusto('P_i.csv')
+    P = df_pi.set_index('i')['Pi'].to_dict()
 
-    # Q_i: Tiempo minimo (i, Qi)
-    Q = cargar_parametro('Q_i.csv', 'i', 'Qi')
+    # 8. Q_i: Tiempo minimo (i, Qi)
+    df_qi = leer_csv_robusto('Q_i.csv')
+    Q = df_qi.set_index('i')['Qi'].to_dict()
 
-    # R_i: Riesgo (i, Ri)
-    R = cargar_parametro('R_i.csv', 'i', 'Ri')
+    # 9. R_i: Riesgo (i, Ri)
+    df_ri = leer_csv_robusto('R_i.csv')
+    R = df_ri.set_index('i')['Ri'].to_dict()
 
 except Exception as e:
     print(f"\n[ERROR CRITICO] Fallo la carga de datos: {e}")
     exit()
 
-# --- Conjuntos Definidos y Escalares ---
+# --- Conjuntos Definidos ---
 B = 128_000_000   # Presupuesto 
 a = 0.67          # Autonomia vuelo (hrs)
 U = 300.0         # Vida util (hrs)
@@ -90,7 +97,7 @@ model = Model("Optimizacion_Monitoreo_Relaves")
 model.setParam('TimeLimit', 1800) # 30 min limite
 
 # --- Variables ---
-x = model.addVars(I, T, vtype=GRB.BINARY, name="x")
+x = model.addVars(I, T, vtype=GRB.BINARY, name="x")     
 z = model.addVars(I, D, T, vtype=GRB.BINARY, name="z")
 q = model.addVars(I, D, T, vtype=GRB.CONTINUOUS, name="q")
 m = model.addVars(D, T, vtype=GRB.BINARY, name="m")
@@ -98,7 +105,8 @@ u_op = model.addVars(T, vtype=GRB.INTEGER, name="u")
 E = model.addVars(D, T, vtype=GRB.CONTINUOUS, name="E")
 l = model.addVars(I, vtype=GRB.CONTINUOUS, name="l")
 
-# --- Función Objetivo ---
+# --- Funcion Objetivo ---
+# Max (Beneficio Riesgo - Penalizaciones)
 obj_beneficio = quicksum(R[i] * x[i,t] for i in I for t in T)
 obj_penalizacion = quicksum(P[i] * l[i] for i in I)
 
@@ -122,9 +130,9 @@ model.addConstrs((u_op[t] <= quicksum(F.get((o,t), 0) for o in O) for t in T), n
 # R4: Autonomia Diaria
 model.addConstrs((quicksum(q[i,d,t] for i in I) <= a * (1 - m[d,t]) for d in D for t in T), name="R4_Autonomia")
 
-# Acumulacion Desgaste (E)
+# Bloque Acumulacion Desgaste (E)
 for d in D:
-    # Caso t=1 (Usamos E0)
+    # Caso t=1
     vuelo_t1 = quicksum(q[i,d,1] for i in I)
     model.addConstr(E0[d] + vuelo_t1 <= U + BigM_horas * m[d,1], name=f"R5_ini_d{d}")
     model.addConstr(E[d,1] <= U * (1 - m[d,1]), name=f"R6_ini_d{d}")
@@ -145,33 +153,34 @@ model.addConstrs((quicksum(z[i,d,t] for i in I) <= 1 - m[d,t] for d in D for t i
 model.addConstrs((quicksum(z[i,d,t] for d in D) >= x[i,t] for i in I for t in T), name="R10_Min")
 model.addConstrs((quicksum(z[i,d,t] for d in D) <= BigM_drones * x[i,t] for i in I for t in T), name="R10_Max")
 
-# R12: Tiempo Minimo
+# R12: Tiempo Minimo (Q)
 model.addConstrs((quicksum(q[i,d,t] for d in D) >= Q[i] * x[i,t] for i in I for t in T), name="R12_Qmin")
 
 # R13: Faltantes
 model.addConstrs((l[i] >= f[i] - quicksum(x[i,t] for t in T) for i in I), name="R13_Faltantes")
 model.addConstrs((l[i] >= 0 for i in I), name="R13_Pos")
 
-# R14: Capacidad Mantenimiento Global
+# R14: Capacidad Mantenimiento
 model.addConstrs((quicksum(m[d,t] for d in D) <= K[t] for t in T), name="R14_K")
 
-# R15: Espaciamiento Dinamico (Gap)
+# R15: Espaciamiento (Gap)
 print("Generando restricciones de espaciamiento...")
 for i in I:
     freq = f[i]
     if freq > 1:
         gap_i = int((365 / freq) * 0.8)
-        gap_i = max(1, gap_i) # Minimo 1 dia
+        gap_i = max(1, gap_i) # Minimo 1 diia
         
         # Ventana movil
         for t_start in range(1, 366 - gap_i + 2):
             window = range(t_start, t_start + gap_i)
-            # Solo sumar dias que estén dentro del horizonte T
             vars_in_window = [x[i,k] for k in window if k in T]
             if vars_in_window:
                 model.addConstr(quicksum(vars_in_window) <= 1, name=f"R15_Gap_i{i}_t{t_start}")
 
+
 # 3. EJECUCION
+
 print("\nIniciando Optimización en Gurobi...")
 model.optimize()
 
